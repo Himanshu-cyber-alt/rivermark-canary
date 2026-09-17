@@ -1,4 +1,4 @@
-
+```yaml
 name: Deploy Backend - Canary
 
 on:
@@ -52,7 +52,7 @@ jobs:
 
 
       # ============================================================
-      # Build
+      # Build Docker image
       # ============================================================
 
       - name: Build backend image
@@ -65,7 +65,7 @@ jobs:
 
 
       # ============================================================
-      # Push
+      # Push Docker image
       # ============================================================
 
       - name: Push backend image
@@ -76,7 +76,7 @@ jobs:
 
 
       # ============================================================
-      # Canary Deployment
+      # Deploy
       # ============================================================
 
       - name: Deploy backend
@@ -89,9 +89,10 @@ jobs:
           echo "Starting Rivermark deployment"
           echo "============================================"
 
-          # ----------------------------------------------------------
+
+          # ==========================================================
           # Create remote deployment script
-          # ----------------------------------------------------------
+          # ==========================================================
 
           cat > /tmp/deploy.sh <<'REMOTE_SCRIPT'
           #!/bin/bash
@@ -103,8 +104,9 @@ jobs:
 
           echo "Image: $IMAGE_URI"
 
+
           # ==========================================================
-          # Login to ECR
+          # ECR Login
           # ==========================================================
 
           REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
@@ -114,13 +116,15 @@ jobs:
           aws ecr get-login-password --region "$AWS_REGION" | \
             docker login --username AWS --password-stdin "$REGISTRY"
 
+
           # ==========================================================
-          # Pull new image
+          # Pull image
           # ==========================================================
 
           echo "Pulling image..."
 
           docker pull "$IMAGE_URI"
+
 
           # ==========================================================
           # FIRST DEPLOYMENT
@@ -135,7 +139,7 @@ jobs:
               docker rm -f rivermark-stable 2>/dev/null || true
               docker rm -f rivermark-canary 2>/dev/null || true
 
-              echo "Starting first stable container..."
+              echo "Starting stable container on port 5000..."
 
               docker run -d \
                 --name rivermark-stable \
@@ -151,13 +155,16 @@ jobs:
                 http://127.0.0.1:5000/health
 
               echo "5000" > /opt/rivermark/stable-port
-
               echo "$IMAGE_URI" > /opt/rivermark/stable-version
+
+
+              # ------------------------------------------------------
+              # First deployment Nginx
+              # ------------------------------------------------------
 
               cat > /etc/nginx/conf.d/rivermark.conf <<'NGINX'
           upstream rivermark_backend {
-              server 127.0.0.1:5000 weight=100;
-              server 127.0.0.1:5001 weight=0;
+              server 127.0.0.1:5000;
           }
 
           server {
@@ -186,6 +193,7 @@ jobs:
               exit 0
           fi
 
+
           # ==========================================================
           # EXISTING DEPLOYMENT
           # ==========================================================
@@ -193,6 +201,7 @@ jobs:
           STABLE_PORT=$(cat /opt/rivermark/stable-port)
 
           echo "Current stable port: $STABLE_PORT"
+
 
           if [ "$STABLE_PORT" = "5000" ]; then
               CANARY_PORT="5001"
@@ -202,11 +211,13 @@ jobs:
 
           echo "New canary port: $CANARY_PORT"
 
+
           # ==========================================================
           # Remove previous canary
           # ==========================================================
 
           docker rm -f rivermark-canary 2>/dev/null || true
+
 
           # ==========================================================
           # Start new canary
@@ -224,8 +235,9 @@ jobs:
 
           sleep 5
 
+
           # ==========================================================
-          # Initial canary health check
+          # Initial health check
           # ==========================================================
 
           echo "Checking initial canary health..."
@@ -233,20 +245,21 @@ jobs:
           if ! curl --fail --silent \
             "http://127.0.0.1:$CANARY_PORT/health"; then
 
-              echo "Initial canary health check FAILED"
+              echo "Canary health check FAILED"
 
               docker rm -f rivermark-canary 2>/dev/null || true
 
               exit 1
           fi
 
-          echo "Initial canary health check PASSED"
+          echo "Canary health check PASSED"
+
 
           # ==========================================================
-          # Function: update nginx
+          # Function: configure Nginx
           # ==========================================================
 
-          update_nginx() {
+          configure_nginx() {
 
               STABLE_WEIGHT="$1"
               CANARY_WEIGHT="$2"
@@ -254,17 +267,95 @@ jobs:
               echo "Stable: $STABLE_WEIGHT%"
               echo "Canary: $CANARY_WEIGHT%"
 
-              sed -i \
-                "s/server 127.0.0.1:$STABLE_PORT weight=[0-9]*;/server 127.0.0.1:$STABLE_PORT weight=$STABLE_WEIGHT;/" \
-                /etc/nginx/conf.d/rivermark.conf
 
-              sed -i \
-                "s/server 127.0.0.1:$CANARY_PORT weight=[0-9]*;/server 127.0.0.1:$CANARY_PORT weight=$CANARY_WEIGHT;/" \
-                /etc/nginx/conf.d/rivermark.conf
+              # ------------------------------------------------------
+              # 100% Stable
+              # ------------------------------------------------------
+
+              if [ "$CANARY_WEIGHT" = "0" ]; then
+
+                  cat > /etc/nginx/conf.d/rivermark.conf <<NGINX
+          upstream rivermark_backend {
+              server 127.0.0.1:$STABLE_PORT;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://rivermark_backend;
+
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          NGINX
+
+
+              # ------------------------------------------------------
+              # 100% Canary
+              # ------------------------------------------------------
+
+              elif [ "$STABLE_WEIGHT" = "0" ]; then
+
+                  cat > /etc/nginx/conf.d/rivermark.conf <<NGINX
+          upstream rivermark_backend {
+              server 127.0.0.1:$CANARY_PORT;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://rivermark_backend;
+
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          NGINX
+
+
+              # ------------------------------------------------------
+              # Weighted rollout
+              # ------------------------------------------------------
+
+              else
+
+                  cat > /etc/nginx/conf.d/rivermark.conf <<NGINX
+          upstream rivermark_backend {
+              server 127.0.0.1:$STABLE_PORT weight=$STABLE_WEIGHT;
+              server 127.0.0.1:$CANARY_PORT weight=$CANARY_WEIGHT;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://rivermark_backend;
+
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          NGINX
+
+              fi
+
 
               nginx -t
               systemctl reload nginx
           }
+
 
           # ==========================================================
           # Function: health check
@@ -278,6 +369,7 @@ jobs:
                 "http://127.0.0.1:$CANARY_PORT/health"
           }
 
+
           # ==========================================================
           # Function: rollback
           # ==========================================================
@@ -286,24 +378,16 @@ jobs:
 
               echo "============================================"
               echo "CANARY FAILED"
-              echo "ROLLING BACK"
+              echo "AUTOMATIC ROLLBACK"
               echo "============================================"
 
-              sed -i \
-                "s/server 127.0.0.1:$STABLE_PORT weight=[0-9]*;/server 127.0.0.1:$STABLE_PORT weight=100;/" \
-                /etc/nginx/conf.d/rivermark.conf
-
-              sed -i \
-                "s/server 127.0.0.1:$CANARY_PORT weight=[0-9]*;/server 127.0.0.1:$CANARY_PORT weight=0;/" \
-                /etc/nginx/conf.d/rivermark.conf
-
-              nginx -t
-              systemctl reload nginx
+              configure_nginx 100 0
 
               docker rm -f rivermark-canary 2>/dev/null || true
 
               echo "Rollback complete"
           }
+
 
           # ==========================================================
           # STAGE 1
@@ -314,7 +398,7 @@ jobs:
           echo "STAGE 1: 90% STABLE / 10% CANARY"
           echo "============================================"
 
-          update_nginx 90 10
+          configure_nginx 90 10
 
           sleep 10
 
@@ -322,6 +406,7 @@ jobs:
               rollback
               exit 1
           fi
+
 
           # ==========================================================
           # STAGE 2
@@ -332,7 +417,7 @@ jobs:
           echo "STAGE 2: 75% STABLE / 25% CANARY"
           echo "============================================"
 
-          update_nginx 75 25
+          configure_nginx 75 25
 
           sleep 10
 
@@ -340,6 +425,7 @@ jobs:
               rollback
               exit 1
           fi
+
 
           # ==========================================================
           # STAGE 3
@@ -350,7 +436,7 @@ jobs:
           echo "STAGE 3: 50% STABLE / 50% CANARY"
           echo "============================================"
 
-          update_nginx 50 50
+          configure_nginx 50 50
 
           sleep 10
 
@@ -359,16 +445,17 @@ jobs:
               exit 1
           fi
 
+
           # ==========================================================
           # STAGE 4
-          # 0 / 100
+          # 100% CANARY
           # ==========================================================
 
           echo "============================================"
           echo "STAGE 4: 100% CANARY"
           echo "============================================"
 
-          update_nginx 0 100
+          configure_nginx 0 100
 
           sleep 10
 
@@ -376,6 +463,7 @@ jobs:
               rollback
               exit 1
           fi
+
 
           # ==========================================================
           # PROMOTE CANARY
@@ -392,31 +480,16 @@ jobs:
             rivermark-stable
 
           echo "$CANARY_PORT" > /opt/rivermark/stable-port
-
           echo "$IMAGE_URI" > /opt/rivermark/stable-version
 
-          echo "New stable port: $CANARY_PORT"
 
           # ==========================================================
-          # Final nginx configuration
+          # Final Nginx configuration
           # ==========================================================
-
-          if [ "$CANARY_PORT" = "5000" ]; then
-
-              NEW_STABLE="5000"
-              OLD_STABLE="5001"
-
-          else
-
-              NEW_STABLE="5001"
-              OLD_STABLE="5000"
-
-          fi
 
           cat > /etc/nginx/conf.d/rivermark.conf <<NGINX
           upstream rivermark_backend {
-              server 127.0.0.1:$NEW_STABLE weight=100;
-              server 127.0.0.1:$OLD_STABLE weight=0;
+              server 127.0.0.1:$CANARY_PORT;
           }
 
           server {
@@ -439,19 +512,29 @@ jobs:
 
           echo "============================================"
           echo "DEPLOYMENT SUCCESSFUL"
+          echo "New stable port: $CANARY_PORT"
           echo "============================================"
 
           REMOTE_SCRIPT
 
+
+          # ==========================================================
           # Replace placeholders
+          # ==========================================================
+
           sed -i "s|__IMAGE_URI__|$IMAGE_URI|g" /tmp/deploy.sh
           sed -i "s|__AWS_REGION__|$AWS_REGION|g" /tmp/deploy.sh
 
-          # Encode script so SSM receives it safely
-          SCRIPT_B64=$(base64 -w 0 /tmp/deploy.sh)
 
           # ==========================================================
-          # Send deployment script to EC2
+          # Base64 encode deployment script
+          # ==========================================================
+
+          SCRIPT_B64=$(base64 -w 0 /tmp/deploy.sh)
+
+
+          # ==========================================================
+          # Send script through SSM
           # ==========================================================
 
           COMMAND_ID=$(aws ssm send-command \
@@ -464,58 +547,64 @@ jobs:
 
           echo "SSM Command ID: $COMMAND_ID"
 
+
           # ==========================================================
           # Wait for deployment
           # ==========================================================
 
           for i in {1..120}; do
 
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" \
-              --output text)
-
-            echo "Deployment status: $STATUS"
-
-            if [ "$STATUS" = "Success" ]; then
-
-              echo "============================================"
-              echo "DEPLOYMENT COMPLETED SUCCESSFULLY"
-              echo "============================================"
-
-              aws ssm get-command-invocation \
+              STATUS=$(aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$INSTANCE_ID" \
                 --region "$AWS_REGION" \
-                --query "StandardOutputContent" \
-                --output text
+                --query "Status" \
+                --output text)
 
-              exit 0
-            fi
+              echo "Deployment status: $STATUS"
 
-            if [ "$STATUS" = "Failed" ] || \
-               [ "$STATUS" = "Cancelled" ] || \
-               [ "$STATUS" = "TimedOut" ]; then
 
-              echo "============================================"
-              echo "DEPLOYMENT FAILED"
-              echo "============================================"
+              if [ "$STATUS" = "Success" ]; then
 
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "$INSTANCE_ID" \
-                --region "$AWS_REGION" \
-                --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
-                --output json
+                  echo "============================================"
+                  echo "DEPLOYMENT COMPLETED SUCCESSFULLY"
+                  echo "============================================"
 
-              exit 1
-            fi
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$INSTANCE_ID" \
+                    --region "$AWS_REGION" \
+                    --query "StandardOutputContent" \
+                    --output text
 
-            sleep 5
+                  exit 0
+              fi
+
+
+              if [ "$STATUS" = "Failed" ] || \
+                 [ "$STATUS" = "Cancelled" ] || \
+                 [ "$STATUS" = "TimedOut" ]; then
+
+                  echo "============================================"
+                  echo "DEPLOYMENT FAILED"
+                  echo "============================================"
+
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" \
+                    --instance-id "$INSTANCE_ID" \
+                    --region "$AWS_REGION" \
+                    --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+                    --output json
+
+                  exit 1
+              fi
+
+
+              sleep 5
 
           done
 
+
           echo "Deployment timed out"
           exit 1
+```
