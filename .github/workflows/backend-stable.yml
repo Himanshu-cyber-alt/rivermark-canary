@@ -1,0 +1,365 @@
+name: Backend - Stable Setup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: rivermark-backend
+
+jobs:
+  deploy-stable:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # AWS OIDC
+      # ============================================================
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKEND_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+
+      # ============================================================
+      # ECR LOGIN
+      # ============================================================
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+
+      # ============================================================
+      # BUILD IMAGE
+      # ============================================================
+
+      - name: Build backend image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker build \
+            -t "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}" \
+            ./backend
+
+
+      # ============================================================
+      # PUSH IMAGE
+      # ============================================================
+
+      - name: Push backend image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker push \
+            "$REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA}"
+
+
+      # ============================================================
+      # DEPLOY BOTH CONTAINERS
+      # ============================================================
+
+      - name: Deploy Stable Environment
+        env:
+          INSTANCE_ID: ${{ secrets.BACKEND_INSTANCE_ID }}
+          IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+
+          echo "============================================"
+          echo "Rivermark Stable Setup"
+          echo "============================================"
+
+          cat > /tmp/deploy-stable.sh <<'REMOTE_SCRIPT'
+          #!/bin/bash
+
+          set -e
+
+          IMAGE_URI="__IMAGE_URI__"
+          AWS_REGION="__AWS_REGION__"
+
+          STABLE_CONTAINER="rivermark-stable"
+          CANARY_CONTAINER="rivermark-canary"
+
+          STABLE_PORT="5000"
+          CANARY_PORT="5001"
+
+          echo "============================================"
+          echo "Starting Stable Environment"
+          echo "============================================"
+
+
+          # ========================================================
+          # ECR LOGIN
+          # ========================================================
+
+          REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
+
+          echo "Logging into ECR..."
+
+          aws ecr get-login-password \
+            --region "$AWS_REGION" | \
+            docker login \
+              --username AWS \
+              --password-stdin "$REGISTRY"
+
+
+          # ========================================================
+          # PULL IMAGE
+          # ========================================================
+
+          echo "Pulling image..."
+
+          docker pull "$IMAGE_URI"
+
+
+          # ========================================================
+          # REMOVE EXISTING CONTAINERS
+          # ========================================================
+
+          echo "Removing existing stable container..."
+
+          docker rm -f "$STABLE_CONTAINER" 2>/dev/null || true
+
+          echo "Removing existing canary container..."
+
+          docker rm -f "$CANARY_CONTAINER" 2>/dev/null || true
+
+
+          # ========================================================
+          # CREATE STABLE
+          # ========================================================
+
+          echo "Starting stable container..."
+
+          docker run -d \
+            --name "$STABLE_CONTAINER" \
+            -p "$STABLE_PORT:5000" \
+            -e APP_VERSION="$IMAGE_URI" \
+            "$IMAGE_URI"
+
+
+          # ========================================================
+          # CREATE CANARY
+          # ========================================================
+
+          echo "Starting canary container..."
+
+          docker run -d \
+            --name "$CANARY_CONTAINER" \
+            -p "$CANARY_PORT:5000" \
+            -e APP_VERSION="$IMAGE_URI" \
+            "$IMAGE_URI"
+
+
+          # ========================================================
+          # WAIT
+          # ========================================================
+
+          sleep 5
+
+
+          # ========================================================
+          # HEALTH CHECK STABLE
+          # ========================================================
+
+          echo "Checking stable..."
+
+          curl --fail --silent \
+            "http://127.0.0.1:$STABLE_PORT/health"
+
+          echo ""
+
+          echo "Stable health check PASSED"
+
+
+          # ========================================================
+          # HEALTH CHECK CANARY
+          # ========================================================
+
+          echo "Checking canary..."
+
+          curl --fail --silent \
+            "http://127.0.0.1:$CANARY_PORT/health"
+
+          echo ""
+
+          echo "Canary health check PASSED"
+
+
+          # ========================================================
+          # SAVE VERSIONS
+          # ========================================================
+
+          mkdir -p /opt/rivermark
+
+          echo "$IMAGE_URI" > /opt/rivermark/stable-version
+          echo "$IMAGE_URI" > /opt/rivermark/canary-version
+
+
+          # ========================================================
+          # NGINX 90/10
+          # ========================================================
+
+          echo "Configuring Nginx 90/10..."
+
+          cat > /etc/nginx/conf.d/rivermark.conf <<NGINX
+          upstream rivermark_backend {
+              server 127.0.0.1:$STABLE_PORT weight=90;
+              server 127.0.0.1:$CANARY_PORT weight=10;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://rivermark_backend;
+
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          NGINX
+
+
+          # ========================================================
+          # TEST NGINX
+          # ========================================================
+
+          nginx -t
+
+
+          # ========================================================
+          # RELOAD NGINX
+          # ========================================================
+
+          systemctl reload nginx
+
+
+          # ========================================================
+          # FINAL OUTPUT
+          # ========================================================
+
+          echo ""
+          echo "============================================"
+          echo "STABLE SETUP COMPLETE"
+          echo "============================================"
+
+          docker ps \
+            --filter "name=$STABLE_CONTAINER" \
+            --filter "name=$CANARY_CONTAINER"
+
+          echo ""
+
+          cat /etc/nginx/conf.d/rivermark.conf
+
+          echo "============================================"
+
+          REMOTE_SCRIPT
+
+
+          # ============================================================
+          # REPLACE VARIABLES
+          # ============================================================
+
+          sed -i \
+            "s|__IMAGE_URI__|$IMAGE_URI|g" \
+            /tmp/deploy-stable.sh
+
+          sed -i \
+            "s|__AWS_REGION__|$AWS_REGION|g" \
+            /tmp/deploy-stable.sh
+
+
+          # ============================================================
+          # BASE64
+          # ============================================================
+
+          SCRIPT_B64=$(base64 -w 0 /tmp/deploy-stable.sh)
+
+
+          # ============================================================
+          # SEND TO EC2
+          # ============================================================
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[\"echo '$SCRIPT_B64' | base64 -d > /tmp/deploy-stable.sh && chmod +x /tmp/deploy-stable.sh && /tmp/deploy-stable.sh\"]" \
+            --region "$AWS_REGION" \
+            --query "Command.CommandId" \
+            --output text)
+
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+
+          # ============================================================
+          # WAIT
+          # ============================================================
+
+          for i in {1..60}; do
+
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" \
+              --output text)
+
+            echo "Status: $STATUS"
+
+
+            if [ "$STATUS" = "Success" ]; then
+
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "StandardOutputContent" \
+                --output text
+
+              exit 0
+
+            fi
+
+
+            if [ "$STATUS" = "Failed" ] || \
+               [ "$STATUS" = "Cancelled" ] || \
+               [ "$STATUS" = "TimedOut" ]; then
+
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$AWS_REGION" \
+                --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+                --output json
+
+              exit 1
+
+            fi
+
+            sleep 5
+
+          done
+
+          echo "Deployment timed out."
+
+          exit 1
