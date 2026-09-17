@@ -146,9 +146,9 @@ resource "aws_iam_role" "github_backend" {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           }
 
-          StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:Himanshu-cyber-alt/rivermark-canary:ref:refs/heads/main"
-          }
+        StringLike = {
+  "token.actions.githubusercontent.com:sub" = "repo:Himanshu-cyber-alt@155243085/rivermark-canary@1373886533:ref:refs/heads/main"
+}
         }
       }
     ]
