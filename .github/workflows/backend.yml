@@ -10,16 +10,6 @@ on:
       - ".github/workflows/backend.yml"
 
   workflow_dispatch:
-    inputs:
-      failure_mode:
-        description: "Failure scenario"
-        required: true
-        default: "normal"
-        type: choice
-        options:
-          - normal
-          - startup-failure
-          - degradation
 
 permissions:
   id-token: write
@@ -34,6 +24,26 @@ env:
 
   STABLE_PORT: 5000
   CANARY_PORT: 5001
+
+  # ------------------------------------------------------------
+  # Change these values to demonstrate different traffic splits.
+  #
+  # Examples:
+  # 90 / 10
+  # 80 / 20
+  # 70 / 30
+  # 60 / 40
+  # 50 / 50
+  # 40 / 60
+  # 30 / 70
+  # 20 / 80
+  # 10 / 90
+  #
+  # Stable + Canary must always equal 100.
+  # Neither value can be 0.
+  # ------------------------------------------------------------
+  STABLE_WEIGHT: 50
+  CANARY_WEIGHT: 50
 
 jobs:
 
@@ -52,7 +62,7 @@ jobs:
 
 
       # ============================================================
-      # 2. AWS OIDC
+      # 2. Configure AWS using GitHub OIDC
       # ============================================================
 
       - name: Configure AWS credentials
@@ -63,7 +73,7 @@ jobs:
 
 
       # ============================================================
-      # 3. Login to ECR
+      # 3. Login to Amazon ECR
       # ============================================================
 
       - name: Login to Amazon ECR
@@ -72,44 +82,61 @@ jobs:
 
 
       # ============================================================
-      # 4. Build and push new image
+      # 4. Build and push Docker image
       # ============================================================
 
       - name: Build and push backend image
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
+
         run: |
+
+          echo "Building backend image..."
 
           docker build \
             -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
             ./backend
 
+
+          echo "Pushing backend image..."
+
           docker push \
             $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
 
           echo "IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_ENV"
 
 
       # ============================================================
-      # 5. Deploy through SSM
+      # 5. Deploy to EC2 using SSM
       # ============================================================
 
       - name: Deploy backend to EC2
         env:
           INSTANCE_ID: ${{ secrets.BACKEND_INSTANCE_ID }}
           IMAGE_URI: ${{ env.IMAGE_URI }}
-          FAILURE_MODE: ${{ inputs.failure_mode || 'normal' }}
+
+          STABLE_WEIGHT: ${{ env.STABLE_WEIGHT }}
+          CANARY_WEIGHT: ${{ env.CANARY_WEIGHT }}
 
         run: |
 
           cat > /tmp/rivermark-deploy.sh <<'REMOTE_SCRIPT'
+
           #!/bin/bash
 
           set -e
 
+
+          # ==========================================================
+          # Variables
+          # ==========================================================
+
           IMAGE_URI="$1"
-          FAILURE_MODE="$2"
+
+          STABLE_WEIGHT="$2"
+          CANARY_WEIGHT="$3"
 
           STABLE_CONTAINER="rivermark-stable"
           CANARY_CONTAINER="rivermark-canary"
@@ -119,32 +146,49 @@ jobs:
 
 
           # ==========================================================
-          # Show current state
+          # Show deployment information
           # ==========================================================
 
           echo "=========================================="
-          echo "RIVERMARK CANARY DEPLOYMENT"
+          echo "RIVERMARK BACKEND DEPLOYMENT"
           echo "=========================================="
 
+          echo ""
           echo "New image:"
           echo "$IMAGE_URI"
 
           echo ""
-          echo "Failure mode:"
-          echo "$FAILURE_MODE"
-
-          echo ""
-          echo "Current containers:"
-          docker ps \
-            --filter "name=$STABLE_CONTAINER" \
-            --filter "name=$CANARY_CONTAINER"
+          echo "Requested traffic:"
+          echo "Stable : ${STABLE_WEIGHT}%"
+          echo "Canary : ${CANARY_WEIGHT}%"
 
 
           # ==========================================================
-          # NGINX CONFIGURATION
-          #
-          # IMPORTANT:
-          # BOTH WEIGHTS ARE ALWAYS GREATER THAN ZERO.
+          # Validate weights
+          # ==========================================================
+
+          if [ "$STABLE_WEIGHT" -le 0 ] || [ "$CANARY_WEIGHT" -le 0 ]; then
+
+              echo "ERROR: Neither weight can be zero."
+
+              exit 1
+
+          fi
+
+
+          TOTAL=$((STABLE_WEIGHT + CANARY_WEIGHT))
+
+          if [ "$TOTAL" -ne 100 ]; then
+
+              echo "ERROR: Stable + Canary must equal 100."
+
+              exit 1
+
+          fi
+
+
+          # ==========================================================
+          # Configure Nginx
           # ==========================================================
 
           configure_nginx() {
@@ -153,37 +197,68 @@ jobs:
               CANARY_WEIGHT="$2"
 
               echo ""
-              echo "------------------------------------------"
-              echo "Updating Nginx"
+              echo "=========================================="
+              echo "UPDATING NGINX"
+              echo "=========================================="
+
               echo "Stable : ${STABLE_WEIGHT}%"
               echo "Canary : ${CANARY_WEIGHT}%"
-              echo "------------------------------------------"
+
 
               if [ "$STABLE_WEIGHT" -le 0 ] || [ "$CANARY_WEIGHT" -le 0 ]; then
-                  echo "ERROR: weight cannot be zero."
+
+                  echo "ERROR: Weight cannot be zero."
+
                   exit 1
+
+              fi
+
+
+              TOTAL=$((STABLE_WEIGHT + CANARY_WEIGHT))
+
+              if [ "$TOTAL" -ne 100 ]; then
+
+                  echo "ERROR: Weights must add up to 100."
+
+                  exit 1
+
               fi
 
 
               cat > /etc/nginx/conf.d/rivermark.conf <<EOF
+
           upstream rivermark_backend {
+
               server 127.0.0.1:${STABLE_PORT} weight=${STABLE_WEIGHT};
+
               server 127.0.0.1:${CANARY_PORT} weight=${CANARY_WEIGHT};
+
           }
 
+
           server {
+
               listen 80;
+
               server_name _;
 
+
               location / {
+
                   proxy_pass http://rivermark_backend;
 
                   proxy_set_header Host \$host;
+
                   proxy_set_header X-Real-IP \$remote_addr;
+
                   proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+
                   proxy_set_header X-Forwarded-Proto \$scheme;
+
               }
+
           }
+
           EOF
 
 
@@ -191,101 +266,16 @@ jobs:
 
               systemctl reload nginx
 
-              echo "Nginx configuration updated."
+
+              echo ""
+
+              echo "Nginx updated successfully."
+
           }
 
 
           # ==========================================================
-          # CANARY HEALTH CHECK
-          # ==========================================================
-
-          check_canary() {
-
-              echo ""
-              echo "Checking canary health..."
-
-              if curl \
-                  --fail \
-                  --silent \
-                  --show-error \
-                  --max-time 5 \
-                  http://127.0.0.1:${CANARY_PORT}/health
-              then
-
-                  echo ""
-                  echo "CANARY HEALTH CHECK PASSED"
-
-                  return 0
-
-              else
-
-                  echo ""
-                  echo "CANARY HEALTH CHECK FAILED"
-
-                  return 1
-
-              fi
-          }
-
-
-          # ==========================================================
-          # ROLLBACK
-          # ==========================================================
-
-          rollback() {
-
-              echo ""
-              echo "=========================================="
-              echo "ROLLBACK STARTED"
-              echo "=========================================="
-
-              echo ""
-              echo "Returning traffic to stable."
-
-              # IMPORTANT:
-              # We still keep BOTH servers in Nginx.
-              #
-              # 90% stable
-              # 10% canary
-              #
-              # No weight becomes zero.
-
-              configure_nginx 90 10
-
-
-              echo ""
-              echo "Removing failed canary..."
-
-              docker rm -f "$CANARY_CONTAINER" 2>/dev/null || true
-
-
-              echo ""
-              echo "Restoring previous stable version as canary..."
-
-              docker run -d \
-                --name "$CANARY_CONTAINER" \
-                -p ${CANARY_PORT}:5000 \
-                -e APP_VERSION="$OLD_STABLE_IMAGE" \
-                "$OLD_STABLE_IMAGE"
-
-
-              sleep 5
-
-
-              echo ""
-              echo "Rollback completed."
-
-              echo ""
-              echo "Final containers:"
-
-              docker ps \
-                --filter "name=$STABLE_CONTAINER" \
-                --filter "name=$CANARY_CONTAINER"
-          }
-
-
-          # ==========================================================
-          # CHECK IF STABLE EXISTS
+          # Check if stable container exists
           # ==========================================================
 
           if docker ps -a \
@@ -315,11 +305,8 @@ jobs:
 
 
               # ------------------------------------------------------
-              # Pull image
+              # Login to ECR
               # ------------------------------------------------------
-
-              echo ""
-              echo "Pulling image..."
 
               aws ecr get-login-password \
                 --region ap-south-1 |
@@ -328,15 +315,15 @@ jobs:
                   --password-stdin \
                   "$(echo "$IMAGE_URI" | cut -d/ -f1)"
 
+
+              # ------------------------------------------------------
+              # Pull image
+              # ------------------------------------------------------
+
+              echo ""
+              echo "Pulling image..."
+
               docker pull "$IMAGE_URI"
-
-
-              # ------------------------------------------------------
-              # Remove any old containers
-              # ------------------------------------------------------
-
-              docker rm -f "$STABLE_CONTAINER" 2>/dev/null || true
-              docker rm -f "$CANARY_CONTAINER" 2>/dev/null || true
 
 
               # ------------------------------------------------------
@@ -367,11 +354,15 @@ jobs:
                 "$IMAGE_URI"
 
 
+              # ------------------------------------------------------
+              # Wait for containers
+              # ------------------------------------------------------
+
               sleep 5
 
 
               # ------------------------------------------------------
-              # Health checks
+              # Check stable
               # ------------------------------------------------------
 
               echo ""
@@ -381,10 +372,15 @@ jobs:
                 --fail \
                 --silent \
                 --show-error \
+                --max-time 5 \
                 http://127.0.0.1:${STABLE_PORT}/health
 
               echo ""
 
+
+              # ------------------------------------------------------
+              # Check canary
+              # ------------------------------------------------------
 
               echo ""
               echo "Checking canary..."
@@ -393,18 +389,19 @@ jobs:
                 --fail \
                 --silent \
                 --show-error \
+                --max-time 5 \
                 http://127.0.0.1:${CANARY_PORT}/health
 
               echo ""
 
 
               # ------------------------------------------------------
-              # Initial routing
-              #
-              # BOTH WEIGHTS > 0
+              # Configure initial traffic
               # ------------------------------------------------------
 
-              configure_nginx 90 10
+              configure_nginx \
+                "$STABLE_WEIGHT" \
+                "$CANARY_WEIGHT"
 
 
               echo ""
@@ -412,6 +409,13 @@ jobs:
               echo "FIRST DEPLOYMENT COMPLETE"
               echo "=========================================="
 
+              echo ""
+              echo "Stable image:"
+              echo "$IMAGE_URI"
+
+              echo ""
+              echo "Canary image:"
+              echo "$IMAGE_URI"
 
               exit 0
 
@@ -421,8 +425,11 @@ jobs:
           # ==========================================================
           # EXISTING DEPLOYMENT
           #
-          # Stable stays untouched.
-          # Only canary is replaced.
+          # IMPORTANT:
+          #
+          # Stable is NEVER recreated here.
+          #
+          # Only the canary container is replaced.
           # ==========================================================
 
           echo ""
@@ -432,7 +439,7 @@ jobs:
 
 
           # ==========================================================
-          # Save current stable image
+          # Show current stable image
           # ==========================================================
 
           OLD_STABLE_IMAGE=$(docker inspect \
@@ -446,11 +453,8 @@ jobs:
 
 
           # ==========================================================
-          # Pull NEW image
+          # Login to ECR
           # ==========================================================
-
-          echo ""
-          echo "Pulling new image..."
 
           aws ecr get-login-password \
             --region ap-south-1 |
@@ -459,13 +463,21 @@ jobs:
               --password-stdin \
               "$(echo "$IMAGE_URI" | cut -d/ -f1)"
 
+
+          # ==========================================================
+          # Pull NEW image
+          # ==========================================================
+
+          echo ""
+          echo "Pulling new image..."
+
           docker pull "$IMAGE_URI"
 
 
           # ==========================================================
-          # DELETE ONLY CANARY
+          # REMOVE ONLY CANARY
           #
-          # Stable is NOT touched.
+          # Stable remains untouched.
           # ==========================================================
 
           echo ""
@@ -481,211 +493,73 @@ jobs:
           echo ""
           echo "Creating new canary..."
 
-
-          if [ "$FAILURE_MODE" = "startup-failure" ]; then
-
-              docker run -d \
-                --name "$CANARY_CONTAINER" \
-                -p ${CANARY_PORT}:5000 \
-                -e APP_VERSION="$IMAGE_URI" \
-                -e FAIL_HEALTH=true \
-                "$IMAGE_URI"
-
-
-          elif [ "$FAILURE_MODE" = "degradation" ]; then
-
-              docker run -d \
-                --name "$CANARY_CONTAINER" \
-                -p ${CANARY_PORT}:5000 \
-                -e APP_VERSION="$IMAGE_URI" \
-                -e DEGRADE_AFTER=12 \
-                "$IMAGE_URI"
-
-
-          else
-
-              docker run -d \
-                --name "$CANARY_CONTAINER" \
-                -p ${CANARY_PORT}:5000 \
-                -e APP_VERSION="$IMAGE_URI" \
-                "$IMAGE_URI"
-
-          fi
-
-
-          sleep 5
-
-
-          # ==========================================================
-          # INITIAL CANARY CHECK
-          # ==========================================================
-
-          if ! check_canary; then
-
-              rollback
-
-              exit 1
-
-          fi
-
-
-          # ==========================================================
-          # PROGRESSIVE CANARY RAMP
-          #
-          # Stable weight steadily DECREASES.
-          # Canary weight steadily INCREASES.
-          #
-          # 90/10 -> 80/20 -> 70/30 -> 60/40 -> 50/50
-          #       -> 40/60 -> 30/70 -> 20/80 -> 10/90
-          #
-          # Never reaches 100/0 or 0/100.
-          # ==========================================================
-
-          CANARY_WEIGHTS=(10 20 30 40 50 60 70 80 90)
-
-          for CANARY_W in "${CANARY_WEIGHTS[@]}"; do
-
-              STABLE_W=$((100 - CANARY_W))
-
-              echo ""
-              echo "=========================================="
-              echo "STAGE: ${STABLE_W}% STABLE / ${CANARY_W}% CANARY"
-              echo "=========================================="
-
-              configure_nginx "$STABLE_W" "$CANARY_W"
-
-              sleep 5
-
-              if ! check_canary; then
-
-                  rollback
-
-                  exit 1
-
-              fi
-
-          done
-
-
-          # ==========================================================
-          # PROMOTION
-          #
-          # Before:
-          #
-          # 5000 → OLD VERSION
-          # 5001 → NEW VERSION
-          #
-          # After:
-          #
-          # 5000 → NEW VERSION
-          # 5001 → OLD VERSION
-          #
-          # We keep Nginx at 90/10.
-          # ==========================================================
-
-          echo ""
-          echo "=========================================="
-          echo "PROMOTING CANARY"
-          echo "=========================================="
-
-
-          NEW_IMAGE="$IMAGE_URI"
-
-
-          echo ""
-          echo "New version:"
-          echo "$NEW_IMAGE"
-
-          echo ""
-          echo "Old stable:"
-          echo "$OLD_STABLE_IMAGE"
-
-
-          # ==========================================================
-          # Stop old stable
-          # ==========================================================
-
-          echo ""
-          echo "Stopping old stable..."
-
-          docker rm -f "$STABLE_CONTAINER"
-
-
-          # ==========================================================
-          # Start NEW version as stable
-          # ==========================================================
-
-          echo ""
-          echo "Starting new stable on port 5000..."
-
           docker run -d \
-            --name "$STABLE_CONTAINER" \
-            -p ${STABLE_PORT}:5000 \
-            -e APP_VERSION="$NEW_IMAGE" \
-            "$NEW_IMAGE"
+            --name "$CANARY_CONTAINER" \
+            -p ${CANARY_PORT}:5000 \
+            -e APP_VERSION="$IMAGE_URI" \
+            "$IMAGE_URI"
 
+
+          # ==========================================================
+          # Wait for canary
+          # ==========================================================
 
           sleep 5
 
 
           # ==========================================================
-          # Check new stable
+          # Check canary
           # ==========================================================
 
           echo ""
-          echo "Checking new stable..."
+          echo "Checking new canary..."
 
           curl \
             --fail \
             --silent \
             --show-error \
             --max-time 5 \
-            http://127.0.0.1:${STABLE_PORT}/health
+            http://127.0.0.1:${CANARY_PORT}/health
 
           echo ""
 
 
           # ==========================================================
-          # Replace canary with OLD stable version
+          # Configure requested traffic split
           # ==========================================================
 
-          echo ""
-          echo "Replacing canary with old stable version..."
-
-          docker rm -f "$CANARY_CONTAINER" 2>/dev/null || true
-
-
-          docker run -d \
-            --name "$CANARY_CONTAINER" \
-            -p ${CANARY_PORT}:5000 \
-            -e APP_VERSION="$OLD_STABLE_IMAGE" \
-            "$OLD_STABLE_IMAGE"
-
-
-          sleep 5
+          configure_nginx \
+            "$STABLE_WEIGHT" \
+            "$CANARY_WEIGHT"
 
 
           # ==========================================================
-          # Final routing
-          #
-          # New stable gets 90%
-          # Old version gets 10%
-          #
-          # BOTH SERVERS REMAIN.
-          # NO WEIGHT IS ZERO.
+          # Deployment information
           # ==========================================================
-
-          configure_nginx 90 10
-
 
           echo ""
           echo "=========================================="
-          echo "DEPLOYMENT SUCCESSFUL"
+          echo "CANARY DEPLOYMENT READY"
           echo "=========================================="
 
 
           echo ""
-          echo "Final containers:"
+          echo "Stable:"
+          echo "$OLD_STABLE_IMAGE"
+
+          echo ""
+          echo "Canary:"
+          echo "$IMAGE_URI"
+
+          echo ""
+          echo "Traffic:"
+          echo "${STABLE_WEIGHT}% → STABLE"
+
+          echo "${CANARY_WEIGHT}% → CANARY"
+
+
+          echo ""
+          echo "Containers:"
 
           docker ps \
             --filter "name=$STABLE_CONTAINER" \
@@ -693,20 +567,24 @@ jobs:
 
 
           echo ""
-          echo "Final traffic:"
-          echo "90% → NEW STABLE :5000"
-          echo "10% → OLD VERSION :5001"
+          echo "=========================================="
+          echo "DEPLOYMENT COMPLETE"
+          echo "=========================================="
 
 
           REMOTE_SCRIPT
 
 
-          # ==========================================================
-          # Send deployment script through SSM
-          # ==========================================================
+          # ============================================================
+          # Encode deployment script
+          # ============================================================
 
           SCRIPT_B64=$(base64 -w 0 /tmp/rivermark-deploy.sh)
 
+
+          # ============================================================
+          # Send script to EC2 through SSM
+          # ============================================================
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
@@ -714,7 +592,7 @@ jobs:
             --parameters "commands=[
               \"echo $SCRIPT_B64 | base64 -d > /tmp/rivermark-deploy.sh\",
               \"chmod +x /tmp/rivermark-deploy.sh\",
-              \"/tmp/rivermark-deploy.sh '$IMAGE_URI' '$FAILURE_MODE'\"
+              \"/tmp/rivermark-deploy.sh '$IMAGE_URI' '$STABLE_WEIGHT' '$CANARY_WEIGHT'\"
             ]" \
             --query "Command.CommandId" \
             --output text)
@@ -725,9 +603,9 @@ jobs:
           echo "$COMMAND_ID"
 
 
-          # ==========================================================
-          # Wait for SSM deployment
-          # ==========================================================
+          # ============================================================
+          # Wait for deployment
+          # ============================================================
 
           for i in {1..60}; do
 
@@ -762,7 +640,6 @@ jobs:
             elif [ "$STATUS" = "Failed" ] ||
                  [ "$STATUS" = "Cancelled" ] ||
                  [ "$STATUS" = "TimedOut" ]; then
-
 
               echo ""
               echo "=========================================="
