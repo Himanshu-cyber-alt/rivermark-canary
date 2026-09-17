@@ -1,3 +1,4 @@
+
 name: Backend Canary Deployment
 
 on:
@@ -105,4 +106,4 @@ jobs:
             --command-id "$COMMAND_ID" \
             --instance-id "$EC2_INSTANCE_ID"
 
-          echo "Canary deployment completed successfully Yes ."
+          echo "Canary deployment completed successfully."

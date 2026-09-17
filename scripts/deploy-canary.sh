@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 set -e
@@ -226,6 +227,8 @@ check_canary() {
         sleep "$HEALTH_WAIT"
     done
 
+    echo "Canary health check failed."
+
     return 1
 }
 
@@ -289,6 +292,10 @@ echo "============================================"
 
 update_nginx 0 100
 
+if ! check_canary; then
+    rollback
+fi
+
 
 # ============================================================
 # Promote Canary to Blue
@@ -299,10 +306,25 @@ echo "============================================"
 echo "PROMOTING CANARY TO BLUE"
 echo "============================================"
 
+echo "Stopping old Blue container..."
+
 docker stop "$BLUE_CONTAINER"
 docker rm "$BLUE_CONTAINER"
 
-docker rename "$CANARY_CONTAINER" "$BLUE_CONTAINER"
+echo "Stopping temporary Canary container..."
+
+docker stop "$CANARY_CONTAINER"
+docker rm "$CANARY_CONTAINER"
+
+echo "Starting new Blue container..."
+
+docker run -d \
+    --name "$BLUE_CONTAINER" \
+    -p 127.0.0.1:${BLUE_PORT}:5000 \
+    -e APP_VERSION="${IMAGE##*:}" \
+    "$IMAGE"
+
+echo "New Blue container started."
 
 
 # ============================================================
@@ -340,7 +362,7 @@ systemctl reload nginx
 
 
 # ============================================================
-# Final Health Check
+# Final Blue Health Check
 # ============================================================
 
 echo ""
@@ -348,11 +370,15 @@ echo "Final Blue health check..."
 
 if ! curl -fsS "http://127.0.0.1:${BLUE_PORT}/health" > /dev/null; then
 
-    echo "ERROR: Promoted Blue failed health check."
+    echo "ERROR: New Blue failed final health check."
 
     exit 1
 fi
 
+
+# ============================================================
+# Deployment Complete
+# ============================================================
 
 echo ""
 echo "============================================"
@@ -361,3 +387,4 @@ echo "============================================"
 
 echo "New Blue image: $IMAGE"
 echo "Traffic: 100% Blue"
+echo "============================================"
