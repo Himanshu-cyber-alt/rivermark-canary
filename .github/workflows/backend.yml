@@ -32,7 +32,7 @@ jobs:
 
 
       # ============================================================
-      # AWS OIDC
+      # Configure AWS using GitHub OIDC
       # ============================================================
 
       - name: Configure AWS credentials
@@ -43,7 +43,7 @@ jobs:
 
 
       # ============================================================
-      # ECR Login
+      # Login to ECR
       # ============================================================
 
       - name: Login to Amazon ECR
@@ -52,7 +52,7 @@ jobs:
 
 
       # ============================================================
-      # Build Docker Image
+      # Build Docker image
       # ============================================================
 
       - name: Build backend image
@@ -61,12 +61,12 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build \
-            -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
             ./backend
 
 
       # ============================================================
-      # Push Docker Image
+      # Push Docker image
       # ============================================================
 
       - name: Push backend image
@@ -74,37 +74,40 @@ jobs:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker push $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
 
       # ============================================================
-      # Canary Deployment
+      # Deploy Canary
       # ============================================================
 
       - name: Deploy canary
         env:
           INSTANCE_ID: ${{ secrets.BACKEND_INSTANCE_ID }}
           IMAGE_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-
         run: |
 
           # ==========================================================
-          # Function: Execute command through SSM
+          # Function: Run command through SSM
           # ==========================================================
 
           run_ssm() {
 
-            local COMMAND="$1"
+            COMMAND="$1"
+
+            PARAMETERS=$(jq -n \
+              --arg command "$COMMAND" \
+              '{commands: [$command]}')
 
             COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$INSTANCE_ID" \
               --document-name "AWS-RunShellScript" \
-              --parameters "commands=[\"$COMMAND\"]" \
+              --parameters "$PARAMETERS" \
               --region "$AWS_REGION" \
               --query "Command.CommandId" \
               --output text)
 
-            echo "SSM Command: $COMMAND_ID"
+            echo "SSM Command ID: $COMMAND_ID"
 
             for i in {1..60}; do
 
@@ -115,9 +118,17 @@ jobs:
                 --query "Status" \
                 --output text)
 
-              echo "SSM status: $STATUS"
+              echo "SSM Status: $STATUS"
 
               if [ "$STATUS" = "Success" ]; then
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --region "$AWS_REGION" \
+                  --query "StandardOutputContent" \
+                  --output text
+
                 return 0
               fi
 
@@ -130,7 +141,9 @@ jobs:
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID" \
-                  --region "$AWS_REGION"
+                  --region "$AWS_REGION" \
+                  --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+                  --output json
 
                 return 1
               fi
@@ -150,51 +163,22 @@ jobs:
 
           echo "Checking current stable port..."
 
-          STABLE_PORT=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters 'commands=["if [ -f /opt/rivermark/stable-port ]; then cat /opt/rivermark/stable-port; else echo 5000; fi"]' \
-            --region "$AWS_REGION" \
-            --query "Command.CommandId" \
-            --output text)
+          GET_PORT_COMMAND=$(cat <<'SCRIPT'
+          if [ -f /opt/rivermark/stable-port ]; then
+              cat /opt/rivermark/stable-port
+          else
+              echo 5000
+          fi
+          SCRIPT
+          )
 
-          echo "Stable-port command: $STABLE_PORT"
+          STABLE_PORT=$(run_ssm "$GET_PORT_COMMAND" | tail -1 | tr -d '[:space:]')
 
-          for i in {1..30}; do
-
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$STABLE_PORT" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" \
-              --output text)
-
-            if [ "$STATUS" = "Success" ]; then
-              break
-            fi
-
-            if [ "$STATUS" = "Failed" ] || \
-               [ "$STATUS" = "Cancelled" ] || \
-               [ "$STATUS" = "TimedOut" ]; then
-              echo "Could not determine stable port"
-              exit 1
-            fi
-
-            sleep 2
-          done
-
-          STABLE_PORT=$(aws ssm get-command-invocation \
-            --command-id "$STABLE_PORT" \
-            --instance-id "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "StandardOutputContent" \
-            --output text | tr -d '[:space:]')
-
-          echo "Current stable port: $STABLE_PORT"
+          echo "Stable port: $STABLE_PORT"
 
 
           # ==========================================================
-          # Select opposite port for canary
+          # Select opposite port for new canary
           # ==========================================================
 
           if [ "$STABLE_PORT" = "5000" ]; then
@@ -203,61 +187,63 @@ jobs:
             CANARY_PORT="5000"
           fi
 
-          echo "Stable port: $STABLE_PORT"
           echo "Canary port: $CANARY_PORT"
 
 
           # ==========================================================
-          # Start new canary
+          # Start new canary container
           # ==========================================================
+
+          START_CANARY_COMMAND=$(cat <<SCRIPT
+          set -e
+
+          echo "Logging into ECR..."
+
+          REGISTRY="\$(echo '$IMAGE_URI' | cut -d/ -f1)"
+
+          aws ecr get-login-password --region $AWS_REGION | \
+            docker login --username AWS --password-stdin "\$REGISTRY"
+
+          echo "Pulling image..."
+
+          docker pull "$IMAGE_URI"
+
+          echo "Removing previous canary container..."
+
+          docker rm -f rivermark-canary 2>/dev/null || true
 
           echo "Starting new canary..."
 
-          START_COMMAND=$(cat <<EOF
-set -e
+          docker run -d \
+            --name rivermark-canary \
+            -p $CANARY_PORT:5000 \
+            -e APP_VERSION="${{ github.sha }}" \
+            "$IMAGE_URI"
 
-echo "Logging into ECR..."
+          echo "Waiting for application..."
 
-REGISTRY="\$(echo '$IMAGE_URI' | cut -d/ -f1)"
+          sleep 5
 
-aws ecr get-login-password --region $AWS_REGION | \
-docker login --username AWS --password-stdin "\$REGISTRY"
+          echo "Canary container:"
 
-echo "Pulling image..."
+          docker ps --filter "name=rivermark-canary"
 
-docker pull '$IMAGE_URI'
+          echo "Checking canary health..."
 
-echo "Removing old container on canary port..."
+          curl --fail --silent http://127.0.0.1:$CANARY_PORT/health
 
-docker rm -f rivermark-canary 2>/dev/null || true
+          echo "Canary is healthy"
+          SCRIPT
+          )
 
-echo "Starting canary container..."
-
-docker run -d \
-  --name rivermark-canary \
-  -p $CANARY_PORT:5000 \
-  -e APP_VERSION='${{ github.sha }}' \
-  '$IMAGE_URI'
-
-sleep 5
-
-echo "Checking canary container..."
-
-docker ps --filter name=rivermark-canary
-
-echo "Checking canary health..."
-
-curl --fail --silent http://127.0.0.1:$CANARY_PORT/health
-
-echo "Canary is healthy"
-EOF
-)
-
-          run_ssm "$START_COMMAND"
+          if ! run_ssm "$START_CANARY_COMMAND"; then
+            echo "Canary failed during startup"
+            exit 1
+          fi
 
 
           # ==========================================================
-          # Function: Update Nginx
+          # Function: Update Nginx traffic
           # ==========================================================
 
           update_nginx() {
@@ -266,47 +252,47 @@ EOF
             CANARY_WEIGHT="$2"
 
             echo "============================================"
-            echo "Traffic update"
+            echo "Updating traffic"
             echo "Stable: $STABLE_WEIGHT%"
             echo "Canary: $CANARY_WEIGHT%"
             echo "============================================"
 
-            NGINX_COMMAND=$(cat <<EOF
-set -e
+            NGINX_COMMAND=$(cat <<SCRIPT
+            set -e
 
-sed -i "s/server 127.0.0.1:$STABLE_PORT weight=[0-9]*;/server 127.0.0.1:$STABLE_PORT weight=$STABLE_WEIGHT;/" /etc/nginx/conf.d/rivermark.conf
+            sed -i "s/server 127.0.0.1:$STABLE_PORT weight=[0-9]*;/server 127.0.0.1:$STABLE_PORT weight=$STABLE_WEIGHT;/" /etc/nginx/conf.d/rivermark.conf
 
-sed -i "s/server 127.0.0.1:$CANARY_PORT weight=[0-9]*;/server 127.0.0.1:$CANARY_PORT weight=$CANARY_WEIGHT;/" /etc/nginx/conf.d/rivermark.conf
+            sed -i "s/server 127.0.0.1:$CANARY_PORT weight=[0-9]*;/server 127.0.0.1:$CANARY_PORT weight=$CANARY_WEIGHT;/" /etc/nginx/conf.d/rivermark.conf
 
-nginx -t
+            nginx -t
 
-systemctl reload nginx
+            systemctl reload nginx
 
-echo "Nginx traffic updated"
-EOF
-)
+            echo "Nginx reload successful"
+            SCRIPT
+            )
 
             run_ssm "$NGINX_COMMAND"
           }
 
 
           # ==========================================================
-          # Function: Canary Health Check
+          # Function: Check canary
           # ==========================================================
 
           check_canary() {
 
-            echo "Checking canary..."
+            echo "Checking canary health..."
 
-            HEALTH_COMMAND="curl --fail --silent http://127.0.0.1:$CANARY_PORT/health"
+            HEALTH_COMMAND="
+            set -e
 
-            if run_ssm "$HEALTH_COMMAND"; then
-              echo "Canary health check PASSED"
-              return 0
-            else
-              echo "Canary health check FAILED"
-              return 1
-            fi
+            curl --fail --silent http://127.0.0.1:$CANARY_PORT/health
+
+            echo 'Canary health check passed'
+            "
+
+            run_ssm "$HEALTH_COMMAND"
           }
 
 
@@ -318,32 +304,36 @@ EOF
 
             echo "============================================"
             echo "CANARY FAILED"
-            echo "STARTING AUTOMATIC ROLLBACK"
+            echo "AUTOMATIC ROLLBACK"
             echo "============================================"
 
-            ROLLBACK_COMMAND=$(cat <<EOF
-set -e
+            ROLLBACK_COMMAND=$(cat <<SCRIPT
+            set -e
 
-sed -i "s/server 127.0.0.1:$STABLE_PORT weight=[0-9]*;/server 127.0.0.1:$STABLE_PORT weight=100;/" /etc/nginx/conf.d/rivermark.conf
+            echo "Restoring 100% traffic to stable..."
 
-sed -i "s/server 127.0.0.1:$CANARY_PORT weight=[0-9]*;/server 127.0.0.1:$CANARY_PORT weight=0;/" /etc/nginx/conf.d/rivermark.conf
+            sed -i "s/server 127.0.0.1:$STABLE_PORT weight=[0-9]*;/server 127.0.0.1:$STABLE_PORT weight=100;/" /etc/nginx/conf.d/rivermark.conf
 
-nginx -t
+            sed -i "s/server 127.0.0.1:$CANARY_PORT weight=[0-9]*;/server 127.0.0.1:$CANARY_PORT weight=0;/" /etc/nginx/conf.d/rivermark.conf
 
-systemctl reload nginx
+            nginx -t
 
-docker rm -f rivermark-canary 2>/dev/null || true
+            systemctl reload nginx
 
-echo "Rollback completed"
-EOF
-)
+            echo "Removing failed canary..."
+
+            docker rm -f rivermark-canary 2>/dev/null || true
+
+            echo "Rollback completed"
+            SCRIPT
+            )
 
             run_ssm "$ROLLBACK_COMMAND"
           }
 
 
           # ==========================================================
-          # Stage 1
+          # STAGE 1
           # 90% Stable / 10% Canary
           # ==========================================================
 
@@ -351,7 +341,10 @@ EOF
           echo "STAGE 1: 90/10"
           echo "============================================"
 
-          update_nginx 90 10
+          if ! update_nginx 90 10; then
+            rollback
+            exit 1
+          fi
 
           if ! check_canary; then
             rollback
@@ -362,7 +355,7 @@ EOF
 
 
           # ==========================================================
-          # Stage 2
+          # STAGE 2
           # 75% Stable / 25% Canary
           # ==========================================================
 
@@ -370,7 +363,10 @@ EOF
           echo "STAGE 2: 75/25"
           echo "============================================"
 
-          update_nginx 75 25
+          if ! update_nginx 75 25; then
+            rollback
+            exit 1
+          fi
 
           sleep 10
 
@@ -381,7 +377,7 @@ EOF
 
 
           # ==========================================================
-          # Stage 3
+          # STAGE 3
           # 50% Stable / 50% Canary
           # ==========================================================
 
@@ -389,7 +385,10 @@ EOF
           echo "STAGE 3: 50/50"
           echo "============================================"
 
-          update_nginx 50 50
+          if ! update_nginx 50 50; then
+            rollback
+            exit 1
+          fi
 
           sleep 10
 
@@ -400,15 +399,18 @@ EOF
 
 
           # ==========================================================
-          # Stage 4
-          # 0% Stable / 100% Canary
+          # STAGE 4
+          # 100% Canary
           # ==========================================================
 
           echo "============================================"
           echo "STAGE 4: 100% CANARY"
           echo "============================================"
 
-          update_nginx 0 100
+          if ! update_nginx 0 100; then
+            rollback
+            exit 1
+          fi
 
           sleep 10
 
@@ -426,48 +428,74 @@ EOF
           echo "PROMOTING CANARY"
           echo "============================================"
 
-          PROMOTE_COMMAND=$(cat <<EOF
-set -e
+          PROMOTE_COMMAND=$(cat <<SCRIPT
+          set -e
 
-docker rm -f rivermark-stable 2>/dev/null || true
+          echo "Removing old stable container..."
 
-docker rename rivermark-canary rivermark-stable
+          docker rm -f rivermark-stable 2>/dev/null || true
 
-echo '$CANARY_PORT' > /opt/rivermark/stable-port
+          echo "Renaming canary to stable..."
 
-echo '${{ github.sha }}' > /opt/rivermark/stable-version
+          docker rename rivermark-canary rivermark-stable
 
-cat > /etc/nginx/conf.d/rivermark.conf <<NGINX
-upstream rivermark_backend {
-    server 127.0.0.1:$CANARY_PORT weight=100;
-    server 127.0.0.1:$STABLE_PORT weight=0;
-}
+          echo "$CANARY_PORT" > /opt/rivermark/stable-port
 
-server {
-    listen 80;
-    server_name _;
+          echo "${{ github.sha }}" > /opt/rivermark/stable-version
 
-    location / {
-        proxy_pass http://rivermark_backend;
+          echo "Canary promoted successfully"
+          SCRIPT
+          )
 
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-}
-NGINX
+          if ! run_ssm "$PROMOTE_COMMAND"; then
+            echo "Promotion failed"
+            exit 1
+          fi
 
-nginx -t
 
-systemctl reload nginx
+          # ==========================================================
+          # Final Nginx configuration
+          # ==========================================================
 
-echo "Canary promoted successfully"
-EOF
-)
+          FINAL_NGINX_COMMAND=$(cat <<SCRIPT
+          set -e
 
-          run_ssm "$PROMOTE_COMMAND"
+          cat > /etc/nginx/conf.d/rivermark.conf <<'NGINX'
+          upstream rivermark_backend {
+              server 127.0.0.1:$CANARY_PORT weight=100;
+              server 127.0.0.1:$STABLE_PORT weight=0;
+          }
+
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://rivermark_backend;
+
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          NGINX
+
+          nginx -t
+
+          systemctl reload nginx
+
+          echo "Final Nginx configuration applied"
+          SCRIPT
+          )
+
+          if ! run_ssm "$FINAL_NGINX_COMMAND"; then
+            echo "Final Nginx configuration failed"
+            exit 1
+          fi
+
 
           echo "============================================"
-          echo "DEPLOYMENT SUCCESSFUL"
+          echo "CANARY DEPLOYMENT SUCCESSFUL"
           echo "============================================"
+
