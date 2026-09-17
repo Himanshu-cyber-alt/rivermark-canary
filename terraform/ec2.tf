@@ -77,10 +77,6 @@ resource "aws_route_table" "public" {
 }
 
 
-# ============================================================
-# Route Table Association
-# ============================================================
-
 resource "aws_route_table_association" "public" {
   subnet_id      = aws_subnet.public.id
   route_table_id = aws_route_table.public.id
@@ -96,10 +92,6 @@ resource "aws_security_group" "backend" {
   description = "Security group for Rivermark backend EC2"
   vpc_id      = aws_vpc.main.id
 
-  # ----------------------------------------------------------
-  # HTTP - Nginx
-  # ----------------------------------------------------------
-
   ingress {
     description = "HTTP"
     from_port   = 80
@@ -107,10 +99,6 @@ resource "aws_security_group" "backend" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-
-  # ----------------------------------------------------------
-  # Outbound traffic
-  # ----------------------------------------------------------
 
   egress {
     description = "Allow outbound traffic"
@@ -180,7 +168,7 @@ resource "aws_iam_instance_profile" "backend_ec2" {
 
 
 # ============================================================
-# EC2 ECR Permissions
+# EC2 ECR Pull Permissions
 # ============================================================
 
 resource "aws_iam_role_policy" "backend_ecr" {
@@ -191,11 +179,6 @@ resource "aws_iam_role_policy" "backend_ecr" {
     Version = "2012-10-17"
 
     Statement = [
-
-      # --------------------------------------------------------
-      # ECR Authentication
-      # --------------------------------------------------------
-
       {
         Effect = "Allow"
 
@@ -205,11 +188,6 @@ resource "aws_iam_role_policy" "backend_ecr" {
 
         Resource = "*"
       },
-
-      # --------------------------------------------------------
-      # Pull Images From ECR
-      # --------------------------------------------------------
-
       {
         Effect = "Allow"
 
@@ -232,7 +210,6 @@ resource "aws_iam_role_policy" "backend_ecr" {
 
 resource "aws_instance" "backend" {
 
-  # Make sure IAM permissions exist before EC2 starts.
   depends_on = [
     aws_iam_role_policy.backend_ecr,
     aws_iam_role_policy_attachment.backend_ssm
@@ -254,192 +231,100 @@ resource "aws_instance" "backend" {
   # ==========================================================
 
   user_data = <<-EOF
-              #!/bin/bash
+#!/bin/bash
 
-              # ============================================================
-              # System Update
-              # ============================================================
+set -e
 
-              dnf update -y
+# ============================================================
+# System Update
+# ============================================================
 
+dnf update -y
 
-              # ============================================================
-              # Install Docker
-              # ============================================================
 
-              dnf install -y docker
+# ============================================================
+# Install Required Packages
+# ============================================================
 
-              systemctl enable docker
-              systemctl start docker
+dnf install -y docker nginx awscli
 
-              usermod -aG docker ec2-user
 
+# ============================================================
+# Start Docker
+# ============================================================
 
-              # ============================================================
-              # Install Nginx
-              # ============================================================
+systemctl enable docker
+systemctl start docker
 
-              dnf install -y nginx
+usermod -aG docker ec2-user
 
-              systemctl enable nginx
-              systemctl start nginx
 
+# ============================================================
+# Create Rivermark Directory
+# ============================================================
 
-              # ============================================================
-              # Rivermark Directory
-              # ============================================================
+mkdir -p /opt/rivermark
 
-              mkdir -p /opt/rivermark
-              chmod 755 /opt/rivermark
+chmod 755 /opt/rivermark
 
 
-              # ============================================================
-              # Wait For Docker
-              # ============================================================
+# ============================================================
+# Remove Default Nginx Configuration
+# ============================================================
 
-              until systemctl is-active --quiet docker
-              do
-                  sleep 2
-              done
+rm -f /etc/nginx/conf.d/default.conf
 
 
-              # ============================================================
-              # Wait For AWS CLI
-              # ============================================================
+# ============================================================
+# Rivermark Nginx Configuration
+# ============================================================
 
-              until command -v aws >/dev/null 2>&1
-              do
-                  sleep 2
-              done
+cat > /etc/nginx/conf.d/rivermark.conf <<'NGINX'
+upstream rivermark_backend {
+    server 127.0.0.1:5000 weight=90;
+    server 127.0.0.1:5001 weight=10;
+}
 
+server {
+    listen 80;
+    server_name _;
 
-              # ============================================================
-              # Login To Amazon ECR
-              # ============================================================
+    location / {
+        proxy_pass http://rivermark_backend;
 
-              aws ecr get-login-password \
-                --region ${var.aws_region} | \
-                docker login \
-                --username AWS \
-                --password-stdin 107001693816.dkr.ecr.ap-south-1.amazonaws.com
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+NGINX
 
 
-              # ============================================================
-              # Initial Blue Image
-              # ============================================================
+# ============================================================
+# Validate Nginx Configuration
+# ============================================================
 
-              BLUE_IMAGE="107001693816.dkr.ecr.ap-south-1.amazonaws.com/rivermark-backend:fc72ae19f24ca763c4c5541c22783eb56600affc"
+nginx -t
 
 
-              # ============================================================
-              # Pull Initial Blue Image
-              # ============================================================
+# ============================================================
+# Enable and Start Nginx
+# ============================================================
 
-              docker pull "$BLUE_IMAGE"
+systemctl enable nginx
+systemctl restart nginx
 
 
-              # ============================================================
-              # Remove Existing Blue Container
-              # ============================================================
+# ============================================================
+# Bootstrap Complete
+# ============================================================
 
-              docker rm -f rivermark-blue 2>/dev/null || true
+echo "============================================"
+echo "Rivermark EC2 bootstrap completed"
+echo "============================================"
 
-
-              # ============================================================
-              # Start Initial Blue Container
-              # ============================================================
-
-              docker run -d \
-                --name rivermark-blue \
-                -p 127.0.0.1:5000:5000 \
-                -e APP_VERSION=fc72ae19f24ca763c4c5541c22783eb56600affc \
-                "$BLUE_IMAGE"
-
-
-              # ============================================================
-              # Wait For Blue Container
-              # ============================================================
-
-              sleep 5
-
-
-              # ============================================================
-              # Configure Nginx
-              # ============================================================
-
-              cat > /etc/nginx/conf.d/rivermark.conf <<'NGINX'
-
-              upstream rivermark_backend {
-                  server 127.0.0.1:5000 weight=100;
-              }
-
-              server {
-                  listen 80;
-                  server_name _;
-
-                  location / {
-                      proxy_pass http://rivermark_backend;
-
-                      proxy_set_header Host $host;
-                      proxy_set_header X-Real-IP $remote_addr;
-                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                      proxy_set_header X-Forwarded-Proto $scheme;
-                  }
-              }
-
-              NGINX
-
-
-              # ============================================================
-              # Test Nginx Configuration
-              # ============================================================
-
-              nginx -t
-
-
-              # ============================================================
-              # Reload Nginx
-              # ============================================================
-
-              systemctl reload nginx
-
-
-              # ============================================================
-              # Blue Health Check
-              # ============================================================
-
-              for i in {1..10}
-              do
-
-                  if curl -fsS http://127.0.0.1:5000/health > /dev/null
-                  then
-                      echo "Blue container is healthy."
-                      break
-                  fi
-
-                  echo "Waiting for Blue container..."
-                  sleep 3
-
-              done
-
-
-              # ============================================================
-              # Final Nginx Health Check
-              # ============================================================
-
-              curl -fsS http://127.0.0.1/health
-
-
-              # ============================================================
-              # Setup Complete
-              # ============================================================
-
-              echo "============================================"
-              echo "Rivermark EC2 setup completed"
-              echo "Initial Blue deployment completed"
-              echo "============================================"
-
-              EOF
+EOF
 
 
   # ============================================================
@@ -453,4 +338,3 @@ resource "aws_instance" "backend" {
     Component   = "backend"
   }
 }
-
