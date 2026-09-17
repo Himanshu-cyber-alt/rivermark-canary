@@ -530,146 +530,41 @@ jobs:
 
 
           # ==========================================================
-          # STAGE 1
+          # PROGRESSIVE CANARY RAMP
           #
-          # 90% STABLE
-          # 10% CANARY
-          # ==========================================================
-
-          echo ""
-          echo "=========================================="
-          echo "STAGE 1"
-          echo "90% STABLE / 10% CANARY"
-          echo "=========================================="
-
-
-          configure_nginx 90 10
-
-          sleep 20
-
-
-          if ! check_canary; then
-
-              rollback
-
-              exit 1
-
-          fi
-
-
-          # ==========================================================
-          # STAGE 2
+          # Stable weight steadily DECREASES.
+          # Canary weight steadily INCREASES.
           #
-          # 75% STABLE
-          # 25% CANARY
-          # ==========================================================
-
-          echo ""
-          echo "=========================================="
-          echo "STAGE 2"
-          echo "75% STABLE / 25% CANARY"
-          echo "=========================================="
-
-
-          configure_nginx 75 25
-
-          sleep 20
-
-
-          if ! check_canary; then
-
-              rollback
-
-              exit 1
-
-          fi
-
-
-          # ==========================================================
-          # STAGE 3
+          # 90/10 -> 80/20 -> 70/30 -> 60/40 -> 50/50
+          #       -> 40/60 -> 30/70 -> 20/80 -> 10/90
           #
-          # 50% STABLE
-          # 50% CANARY
+          # Never reaches 100/0 or 0/100.
           # ==========================================================
 
-          echo ""
-          echo "=========================================="
-          echo "STAGE 3"
-          echo "50% STABLE / 50% CANARY"
-          echo "=========================================="
+          CANARY_WEIGHTS=(10 20 30 40 50 60 70 80 90)
 
+          for CANARY_W in "${CANARY_WEIGHTS[@]}"; do
 
-          configure_nginx 50 50
+              STABLE_W=$((100 - CANARY_W))
 
-          sleep 20
+              echo ""
+              echo "=========================================="
+              echo "STAGE: ${STABLE_W}% STABLE / ${CANARY_W}% CANARY"
+              echo "=========================================="
 
+              configure_nginx "$STABLE_W" "$CANARY_W"
 
-          if ! check_canary; then
+              sleep 20
 
-              rollback
+              if ! check_canary; then
 
-              exit 1
+                  rollback
 
-          fi
+                  exit 1
 
+              fi
 
-          # ==========================================================
-          # STAGE 4
-          #
-          # 25% STABLE
-          # 75% CANARY
-          # ==========================================================
-
-          echo ""
-          echo "=========================================="
-          echo "STAGE 4"
-          echo "25% STABLE / 75% CANARY"
-          echo "=========================================="
-
-
-          configure_nginx 25 75
-
-          sleep 20
-
-
-          if ! check_canary; then
-
-              rollback
-
-              exit 1
-
-          fi
-
-
-          # ==========================================================
-          # STAGE 5
-          #
-          # 10% STABLE
-          # 90% CANARY
-          #
-          # NEVER 100/0
-          # NEVER 0/100
-          # ==========================================================
-
-          echo ""
-          echo "=========================================="
-          echo "STAGE 5"
-          echo "10% STABLE / 90% CANARY"
-          echo "=========================================="
-
-
-          configure_nginx 10 90
-
-          sleep 20
-
-
-          if ! check_canary; then
-
-              rollback
-
-              exit 1
-
-          fi
+          done
 
 
           # ==========================================================

@@ -21,7 +21,7 @@ def root():
         "application": "Rivermark Backend",
         "version": VERSION,
         "request_count": request_count,
-        "message": f"Hello from v3 {VERSION}",
+        "message": f"Hello from v4 {VERSION}",
     }
 
 
