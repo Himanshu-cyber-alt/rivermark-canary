@@ -1,4 +1,4 @@
-```yaml
+
 name: Deploy Backend - Canary
 
 on:
@@ -607,4 +607,4 @@ jobs:
 
           echo "Deployment timed out"
           exit 1
-```
+
