@@ -554,7 +554,7 @@ jobs:
 
               configure_nginx "$STABLE_W" "$CANARY_W"
 
-              sleep 20
+              sleep 5
 
               if ! check_canary; then
 
