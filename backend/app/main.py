@@ -21,7 +21,7 @@ def root():
         "application": "Rivermark Backend",
         "version": VERSION,
         "request_count": request_count,
-        "message": f"Hello from  Canary {VERSION}",
+        "message": f"Hello from  Canary 1 {VERSION}",
     }
 
 
