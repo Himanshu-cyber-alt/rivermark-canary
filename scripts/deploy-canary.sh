@@ -52,7 +52,7 @@ fi
 
 
 # ============================================================
-# Pull new image
+# Pull new Docker image
 # ============================================================
 
 echo ""
@@ -62,7 +62,7 @@ docker pull "$IMAGE"
 
 
 # ============================================================
-# Remove old Canary if it exists
+# Remove old Canary if present
 # ============================================================
 
 echo ""
@@ -121,6 +121,8 @@ rollback() {
     echo "CANARY FAILED - ROLLING BACK"
     echo "============================================"
 
+    echo "Restoring 100% traffic to Blue..."
+
     cat > "$NGINX_CONFIG" <<EOF
 upstream rivermark_backend {
     server 127.0.0.1:${BLUE_PORT} weight=100;
@@ -177,7 +179,67 @@ update_nginx() {
     echo "Blue   = ${BLUE_WEIGHT}%"
     echo "Canary = ${CANARY_WEIGHT}%"
 
-    cat > "$NGINX_CONFIG" <<EOF
+    # ========================================================
+    # 100% Canary
+    # Nginx does NOT support weight=0.
+    # Therefore only configure the Canary server.
+    # ========================================================
+
+    if [ "$BLUE_WEIGHT" -eq 0 ]; then
+
+        cat > "$NGINX_CONFIG" <<EOF
+upstream rivermark_backend {
+    server 127.0.0.1:${CANARY_PORT} weight=100;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://rivermark_backend;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+    # ========================================================
+    # 100% Blue
+    # ========================================================
+
+    elif [ "$CANARY_WEIGHT" -eq 0 ]; then
+
+        cat > "$NGINX_CONFIG" <<EOF
+upstream rivermark_backend {
+    server 127.0.0.1:${BLUE_PORT} weight=100;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://rivermark_backend;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+    # ========================================================
+    # Blue + Canary
+    # ========================================================
+
+    else
+
+        cat > "$NGINX_CONFIG" <<EOF
 upstream rivermark_backend {
     server 127.0.0.1:${BLUE_PORT} weight=${BLUE_WEIGHT};
     server 127.0.0.1:${CANARY_PORT} weight=${CANARY_WEIGHT};
@@ -198,7 +260,17 @@ server {
 }
 EOF
 
+    fi
+
+    # ========================================================
+    # Validate Nginx
+    # ========================================================
+
     nginx -t
+
+    # ========================================================
+    # Reload Nginx
+    # ========================================================
 
     systemctl reload nginx
 
@@ -316,6 +388,11 @@ echo "Stopping temporary Canary container..."
 docker stop "$CANARY_CONTAINER"
 docker rm "$CANARY_CONTAINER"
 
+
+# ============================================================
+# Start New Blue Container
+# ============================================================
+
 echo "Starting new Blue container..."
 
 docker run -d \
@@ -328,7 +405,7 @@ echo "New Blue container started."
 
 
 # ============================================================
-# Recreate Nginx configuration with Blue
+# Recreate Nginx Configuration
 # ============================================================
 
 cat > "$NGINX_CONFIG" <<EOF
@@ -388,3 +465,4 @@ echo "============================================"
 echo "New Blue image: $IMAGE"
 echo "Traffic: 100% Blue"
 echo "============================================"
+
