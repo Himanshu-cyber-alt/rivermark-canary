@@ -1,7 +1,6 @@
 # ============================================================
-# Rivermark Frontend - GitHub OIDC Provider
+# Rivermark - GitHub OIDC Provider
 # ============================================================
-
 
 resource "aws_iam_openid_connect_provider" "github_frontend" {
   url = "https://token.actions.githubusercontent.com"
@@ -123,6 +122,131 @@ resource "aws_iam_role_policy" "github_frontend" {
 
 
 # ============================================================
+# Rivermark Backend - GitHub Actions IAM Role
+# ============================================================
+
+resource "aws_iam_role" "github_backend" {
+  name = "rivermark-github-backend-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Effect = "Allow"
+
+        Principal = {
+          Federated = aws_iam_openid_connect_provider.github_frontend.arn
+        }
+
+        Action = "sts:AssumeRoleWithWebIdentity"
+
+        Condition = {
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          }
+
+          StringLike = {
+            "token.actions.githubusercontent.com:sub" = "repo:Himanshu-cyber-alt/rivermark-canary:ref:refs/heads/main"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = {
+    Name      = "rivermark-github-backend-role"
+    Project   = "rivermark"
+    Component = "backend"
+  }
+}
+
+
+# ============================================================
+# Backend GitHub Actions - ECR Permissions
+# ============================================================
+
+resource "aws_iam_role_policy" "github_backend_ecr" {
+  name = "rivermark-github-backend-ecr-policy"
+
+  role = aws_iam_role.github_backend.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+
+      # ------------------------------------------------------
+      # ECR - Authentication
+      # ------------------------------------------------------
+
+      {
+        Effect = "Allow"
+
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+
+        Resource = "*"
+      },
+
+
+      # ------------------------------------------------------
+      # ECR - Push backend Docker image
+      # ------------------------------------------------------
+
+      {
+        Effect = "Allow"
+
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:CompleteLayerUpload",
+          "ecr:InitiateLayerUpload",
+          "ecr:PutImage",
+          "ecr:UploadLayerPart"
+        ]
+
+        Resource = aws_ecr_repository.backend.arn
+      }
+    ]
+  })
+}
+
+
+# ============================================================
+# Backend GitHub Actions - SSM Permissions
+# ============================================================
+
+resource "aws_iam_role_policy" "github_backend_ssm" {
+  name = "rivermark-github-backend-ssm-policy"
+
+  role = aws_iam_role.github_backend.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+
+      # ------------------------------------------------------
+      # SSM - Send deployment command to EC2
+      # ------------------------------------------------------
+
+      {
+        Effect = "Allow"
+
+        Action = [
+          "ssm:SendCommand",
+          "ssm:GetCommandInvocation"
+        ]
+
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+
+# ============================================================
 # Outputs
 # ============================================================
 
@@ -132,8 +256,16 @@ output "github_frontend_oidc_provider_arn" {
   value = aws_iam_openid_connect_provider.github_frontend.arn
 }
 
+
 output "github_frontend_role_arn" {
   description = "IAM role ARN used by frontend GitHub Actions"
 
   value = aws_iam_role.github_frontend.arn
+}
+
+
+output "github_backend_role_arn" {
+  description = "IAM role ARN used by backend GitHub Actions"
+
+  value = aws_iam_role.github_backend.arn
 }

@@ -211,3 +211,36 @@ resource "aws_instance" "backend" {
     Component   = "backend"
   }
 }
+
+
+resource "aws_iam_role_policy" "backend_ecr" {
+  name = "${var.project_name}-backend-ecr-policy"
+  role = aws_iam_role.backend_ec2.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Effect = "Allow"
+
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage"
+        ]
+
+        Resource = aws_ecr_repository.backend.arn
+      }
+    ]
+  })
+}

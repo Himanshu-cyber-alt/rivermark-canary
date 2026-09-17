@@ -24,3 +24,9 @@ output "backend_public_ip" {
   description = "Backend EC2 public IP"
   value       = aws_instance.backend.public_ip
 }
+
+
+output "backend_ecr_repository_url" {
+  description = "ECR repository URL for the backend"
+  value       = aws_ecr_repository.backend.repository_url
+}
